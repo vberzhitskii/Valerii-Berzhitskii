@@ -15,7 +15,7 @@
 ### Проекты
 | Название | Описание | Технологии |
 |-----------|-----------|-------------|
-| [bq_to_pg_etl](https://github.com/valeriy-berzhitskiy/bq_to_pg_etl) | Скрипт ETL для выгрузки данных из BigQuery в PostgreSQL | Python, psycopg2 |
+| [bq_to_pg_etl](https://github.com/valeriy-berzhitskiy/airflow_bigquery_scor_load) | Скрипт ETL для выгрузки данных из BigQuery в PostgreSQL | Python, psycopg2 |
 | [airflow_daily_load](https://github.com/valeriy-berzhitskiy/airflow_daily_load) | DAG для ежедневной загрузки данных с логами | Airflow, Postgres |
 | [wallet_dashboard](https://github.com/valeriy-berzhitskiy/wallet_dashboard) | Power BI/Looker дашборд по транзакциям кошельков | SQL, Power BI |
 
