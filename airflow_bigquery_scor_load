@@ -36,8 +36,8 @@ from airflow.providers.postgres.hooks.postgres import PostgresHook
 from airflow.providers.oracle.hooks.oracle import OracleHook
 
 # Настройка прокси (если требуется)
-proxy_host = '172.27.222.221'-- здесь мы прописываем прокси через который мы хотим зайти в сам Bigquery по другому Airflow не сможет зайти в БД Bigquery
-proxy_port = 3213-- порт нашей прокси
+proxy_host = '176.22.222.223'-- здесь мы прописываем прокси через который мы хотим зайти в сам Bigquery по другому Airflow не сможет зайти в БД Bigquery
+proxy_port = 2222-- порт нашей прокси
 os.environ['http_proxy'] = f'http://{proxy_host}:{proxy_port}'
 os.environ['https_proxy'] = f'http://{proxy_host}:{proxy_port}'
 
