@@ -1,0 +1,249 @@
+## --------------------------------------------------------------------------------------------
+## Описание работы DAG: 012013_bigquery_scor_load_to_oracle
+##
+## Данный DAG реализован в среде Airflow и предназначен для автоматической ежедневной ETL-загрузки.
+##
+## Принцип работы:
+## 1️⃣ Ежедневно в 07:20 по Бишкекскому времени DAG запускается автоматически.
+## 2️⃣ Из BigQuery (данные Google Analytics) выгружаются события пользователей 
+##     — moiO_travel, moiO_promoBlock_pdl, moiO_promoBlock_bnpl7.
+## 3️⃣ Полученные данные очищаются и конвертируются в pandas DataFrame.
+## 4️⃣ Обработанные данные записываются в таблицу PostgreSQL (akcha_travel_ga).
+## 5️⃣ Из PostgreSQL данные разделяются по категориям ("Акча" и "Трэвел") 
+##     и отправляются в соответствующие таблицы Oracle:
+##        - mmp_akcha_events
+##        - mmp_travel_events
+##
+## Таким образом DAG выполняет полный цикл ETL:
+## BigQuery → Postgres → Oracle.
+##
+## Используемые технологии:
+## - Airflow (управление задачами)
+## - BigQueryHook (чтение данных)
+## - PostgresHook (загрузка и промежуточное хранение)
+## - OracleHook (финальная запись данных)
+##
+## Автор: Valerii Berzhitskii
+## --------------------------------------------------------------------------------------------
+import os
+import pendulum
+from airflow import DAG
+from airflow.operators.python_operator import PythonOperator
+import pandas as pd
+from datetime import datetime, timedelta
+from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
+from airflow.providers.postgres.hooks.postgres import PostgresHook
+from airflow.providers.oracle.hooks.oracle import OracleHook
+
+# Настройка прокси (если требуется)
+proxy_host = '172.27.222.221'-- здесь мы прописываем прокси через который мы хотим зайти в сам Bigquery по другому Airflow не сможет зайти в БД Bigquery
+proxy_port = 3213-- порт нашей прокси
+os.environ['http_proxy'] = f'http://{proxy_host}:{proxy_port}'
+os.environ['https_proxy'] = f'http://{proxy_host}:{proxy_port}'
+
+
+def query_bq_data(query, gcp_conn_id):
+    """Выполнение запроса к BigQuery"""
+    bq_hook = BigQueryHook(gcp_conn_id=gcp_conn_id, use_legacy_sql=False)
+    client = bq_hook.get_client()
+    query_job = client.query(query)
+    results = query_job.result()
+    headers = [field.name for field in results.schema]
+    rows = [list(row.values()) for row in results]
+    return pd.DataFrame(rows, columns=headers)
+
+
+def load_to_postgres(**kwargs):
+    """Загрузка данных в PostgreSQL"""
+    yesterday = (datetime.now() - timedelta(1)).strftime('%Y%m%d')
+    
+    query = f""" Основной скрипт по которому работает выгрузка из Bigquery в ORACLE 
+    WITH user_events AS (
+        SELECT 
+            user_id,
+            event_date,
+            event_timestamp,
+            CASE 
+                WHEN (event_name = 'moiO_travel'
+                      OR (SELECT ep.value.string_value 
+                          FROM UNNEST(event_params) ep 
+                          WHERE ep.key = 'tap_section') = 'moiO_travel')
+                THEN 'Трэвел'
+                WHEN (event_name IN ('moiO_promoBlock_pdl', 'moiO_promoBlock_bnpl7')
+                      OR (SELECT ep.value.string_value
+                          FROM UNNEST(event_params) ep 
+                          WHERE ep.key = 'tap_section') IN ('moiO_promoBlock_pdl', 'moiO_promoBlock_bnpl7'))
+                THEN 'Акча'
+                ELSE 'Other'
+            END AS event_category
+        FROM `oapp-29e9c.analytics_179418798.events_intraday_*`
+        WHERE _TABLE_SUFFIX LIKE '{yesterday}%'
+          AND event_date = '{yesterday}'
+          AND (event_name IN ('moiO_travel', 'moiO_promoBlock_pdl', 'moiO_promoBlock_bnpl7')
+               OR EXISTS (
+                   SELECT 1
+                   FROM UNNEST(event_params) ep
+                   WHERE ep.key = 'tap_section'
+                     AND ep.value.string_value IN ('moiO_travel', 'moiO_promoBlock_pdl', 'moiO_promoBlock_bnpl7')
+               ))
+    ),
+    deduplicated_events AS (
+        SELECT 
+            user_id,
+            event_date,
+            event_category,
+            ROW_NUMBER() OVER (
+                PARTITION BY user_id, event_date, event_category
+                ORDER BY event_timestamp
+            ) AS rn
+        FROM user_events
+        WHERE event_category IN ('Трэвел', 'Акча')
+    )
+    SELECT 
+        user_id,
+        event_date,
+        event_category
+    FROM deduplicated_events
+    WHERE rn = 1
+    ORDER BY user_id, event_date, event_category
+    """
+
+    # Получаем данные из BigQuery
+    df = query_bq_data(query, 'GOOGLE_BIGQUERY_oapp-29e9c')
+    
+    # Подготовка данных
+    df['user_id'] = df['user_id'].astype(str)
+    df['event_date'] = pd.to_datetime(df['event_date'].astype(str), errors='coerce').dt.date
+    df['event_category'] = df['event_category'].astype(str)
+
+    # Загрузка в PostgreSQL
+    pg_hook = PostgresHook(postgres_conn_id='PGDWH_GT_REPORTING_ANALYSIS')
+    conn = pg_hook.get_conn()
+    cursor = conn.cursor()
+    
+    try:
+        cursor.executemany(
+            "INSERT INTO akcha_travel_ga (user_id, event_date, event_category) VALUES (%s, %s, %s)",
+            [tuple(row) for row in df[['user_id', 'event_date', 'event_category']].values]
+        )
+        conn.commit()
+        print(f"Успешно загружено {len(df)} записей в akcha_travel_ga")
+    except Exception as e:
+        conn.rollback()
+        raise e
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def load_akcha_events(**kwargs):
+    """Загрузка данных по Акче в Oracle"""
+    pg_hook = PostgresHook(postgres_conn_id='PGDWH_GT_REPORTING_ANALYSIS')--
+    oracle_hook = OracleHook(oracle_conn_id='ORCL_DWH_REPORTING_ANALYSIS')--
+    
+    # Получаем данные из PostgreSQL
+    pg_conn = pg_hook.get_conn()
+    try:
+        df = pd.read_sql("""
+            SELECT a.mobile, g.event_date
+            FROM akcha_travel_ga g
+            JOIN otp_users_accounts a ON a.account_id::text = g.user_id::text
+            WHERE g.event_category = 'Акча'
+        """, pg_conn)
+    finally:
+        pg_conn.close()
+    
+    # Приведение типов (фикс timestamp -> date)
+    df['event_date'] = pd.to_datetime(df['event_date'].astype(str), errors='coerce').dt.date
+    
+    # Загрузка в Oracle
+    ora_conn = oracle_hook.get_conn()
+    try:
+        cursor = ora_conn.cursor()
+        cursor.executemany(
+            "INSERT INTO mmp_akcha_events (mobile, event_date) VALUES (:1, :2)",
+            [tuple(row) for row in df.values]
+        )
+        ora_conn.commit()
+        print(f"Успешно загружено {len(df)} записей в mmp_akcha_events")
+    except Exception as e:
+        ora_conn.rollback()
+        raise e
+    finally:
+        ora_conn.close()
+
+
+def load_travel_events(**kwargs):
+    """Загрузка данных по Трэвелу в Oracle"""
+    pg_hook = PostgresHook(postgres_conn_id='PGDWH_GT_REPORTING_ANALYSIS')
+    oracle_hook = OracleHook(oracle_conn_id='ORCL_DWH_REPORTING_ANALYSIS')
+    
+    # Получаем данные из PostgreSQL
+    pg_conn = pg_hook.get_conn()
+    try:
+        df = pd.read_sql("""
+            SELECT a.mobile, g.event_date
+            FROM akcha_travel_ga g
+            JOIN otp_users_accounts a ON a.account_id::text = g.user_id::text
+            WHERE g.event_category = 'Трэвел'
+        """, pg_conn)
+    finally:
+        pg_conn.close()
+    
+    # Приведение типов (фикс timestamp -> date)
+    df['event_date'] = pd.to_datetime(df['event_date'].astype(str), errors='coerce').dt.date
+    
+    # Загрузка в Oracle
+    ora_conn = oracle_hook.get_conn()
+    try:
+        cursor = ora_conn.cursor()
+        cursor.executemany(
+            "INSERT INTO mmp_travel_events (mobile, event_date) VALUES (:1, :2)",
+            [tuple(row) for row in df.values]
+        )
+        ora_conn.commit()
+        print(f"Успешно загружено {len(df)} записей в mmp_travel_events")
+    except Exception as e:
+        ora_conn.rollback()
+        raise e
+    finally:
+        ora_conn.close()
+
+
+# Настройки DAG
+local_tz = pendulum.timezone("Asia/Bishkek")
+
+default_args = {
+    'owner': 'reporting_and_analysis',
+    'start_date': pendulum.datetime(2024, 12, 1, tz=local_tz),
+    'retries': 1,
+    'retry_delay': timedelta(minutes=5),
+    'depends_on_past': False,
+}
+
+with DAG(
+    dag_id='012013_bigquery_scor_load_to_oracle',
+    default_args=default_args,
+    description='Загрузка данных из BigQuery в PostgreSQL и Oracle',
+    schedule_interval='20 7 * * *',
+    catchup=False,
+    tags=["bigquery", "oracle", "vberzhitskii228"],
+    max_active_runs=1,
+) as dag:
+
+    load_to_pg_task = PythonOperator(
+        task_id='load_to_postgres',
+        python_callable=load_to_postgres,
+    )
+
+    load_akcha_task = PythonOperator(
+        task_id='load_akcha_events',
+        python_callable=load_akcha_events,
+    )
+
+    load_travel_task = PythonOperator(
+        task_id='load_travel_events',
+        python_callable=load_travel_events,
+    )
+
+    load_to_pg_task >> [load_akcha_task, load_travel_task]
